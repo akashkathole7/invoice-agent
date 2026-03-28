@@ -4,11 +4,19 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from openenv.core.env_server.types import Action, Observation
 
 
-class InvoiceAction(BaseModel):
+class InvoiceAction(Action):
     """An action the agent can take during invoice processing."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        arbitrary_types_allowed=True,
+    )
 
     action_type: Literal[
         "extract_field",
@@ -46,8 +54,14 @@ class InvoiceAction(BaseModel):
     )
 
 
-class InvoiceObservation(BaseModel):
+class InvoiceObservation(Observation):
     """What the agent observes after each step."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        arbitrary_types_allowed=True,
+    )
 
     invoice_text: str = Field(..., description="The raw invoice text to process.")
     extracted_fields: Dict[str, str] = Field(
@@ -92,6 +106,11 @@ class InvoiceObservation(BaseModel):
         ],
         description="Actions available to the agent.",
     )
+
+    # Session tracking (for stateful HTTP sessions)
+    session_id: str = Field("", description="Session identifier for step calls.")
+    # Grader score (set when episode is done)
+    grader_score: float = Field(0.0, description="Final grader score (set on done).")
 
 
 class InvoiceState(BaseModel):

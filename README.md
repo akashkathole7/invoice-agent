@@ -1,3 +1,18 @@
+---
+title: InvoiceAgent
+emoji: 🧾
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+tags:
+  - openenv
+  - invoice
+  - data-extraction
+  - accounts-payable
+---
+
 # InvoiceAgent — OpenEnv Environment for Automated Invoice Processing
 
 ## Overview

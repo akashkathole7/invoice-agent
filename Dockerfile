@@ -13,9 +13,9 @@ COPY . .
 
 # /app/invoice_agent/ is now a proper Python package
 # imports like "from invoice_agent.models import ..." resolve correctly
-EXPOSE 8000
+EXPOSE 7860
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import requests; r=requests.get('http://localhost:8000/health'); r.raise_for_status()" || exit 1
+    CMD python -c "import requests; r=requests.get('http://localhost:7860/health'); r.raise_for_status()" || exit 1
 
-CMD ["uvicorn", "invoice_agent.server.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "invoice_agent.server.app:app", "--host", "0.0.0.0", "--port", "7860"]

@@ -116,7 +116,7 @@ def run_episode(task_id: str, seed: int = 42) -> float:
     )
     data = resp.json()
     obs = data["observation"]
-    session_id = data["info"]["session_id"]
+    session_id = obs.get("session_id") or data.get("info", {}).get("session_id", "")
     done = data["done"]
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]

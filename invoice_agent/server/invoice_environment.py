@@ -5,6 +5,9 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from openenv.core.env_server.interfaces import Environment
+from openenv.core.env_server.types import State
+
 from invoice_agent.data.invoice_templates import (
     generate_invoice,
     get_required_fields,
@@ -20,44 +23,59 @@ from invoice_agent.data.vendor_database import generate_vendor_db, search_vendor
 from invoice_agent.graders import GRADERS
 from invoice_agent.models import InvoiceAction, InvoiceObservation, InvoiceState
 
+# Global session store: episode_id -> InvoiceEnvironment instance
+# Used by the custom /step/{session_id} endpoint to maintain stateful sessions.
+_SESSIONS: Dict[str, "InvoiceEnvironment"] = {}
 
-class InvoiceEnvironment:
+
+class InvoiceEnvironment(Environment):
     """OpenEnv-compliant invoice processing environment."""
 
+    SUPPORTS_CONCURRENT_SESSIONS = True
     MAX_STEPS = 25
 
     def __init__(self) -> None:
+        super().__init__()
         self._state: Optional[InvoiceState] = None
+        self._last_vendor_result = None
+        self._last_po_result = None
+        self._last_validation_errors = None
+        self._last_validation_warnings = None
 
-    def reset(self, task_id: str = "easy", seed: int = 42) -> Tuple[InvoiceObservation, float, bool, Dict[str, Any]]:
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        episode_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> InvoiceObservation:
         """Reset the environment for a new episode."""
-        episode_id = str(uuid.uuid4())[:8]
+        task_id: str = kwargs.get("task_id", "easy")
+        resolved_seed: int = seed if seed is not None else 42
+        resolved_episode_id: str = episode_id or str(uuid.uuid4())[:8]
 
         # Generate invoice data
-        invoice_data, invoice_text = generate_invoice(seed, task_id)
+        invoice_data, invoice_text = generate_invoice(resolved_seed, task_id)
         ground_truth = invoice_data.to_ground_truth(task_id)
         discrepancies: List[Dict[str, str]] = []
 
-        # Inject errors for medium/hard
         import random
-        rng = random.Random(seed + 300)
+        rng = random.Random(resolved_seed + 300)
 
         if task_id == "medium":
             invoice_text, discrepancies = inject_errors_medium(invoice_data, invoice_text, rng)
         elif task_id == "hard":
             invoice_text, discrepancies = inject_errors_hard(invoice_data, invoice_text, rng)
 
-        # Generate supporting data
-        vendor_db = generate_vendor_db(seed, invoice_data.vendor_name, task_id)
-        purchase_orders = generate_purchase_order(seed, invoice_data, task_id)
+        vendor_db = generate_vendor_db(resolved_seed, invoice_data.vendor_name, task_id)
+        purchase_orders = generate_purchase_order(resolved_seed, invoice_data, task_id)
 
         self._state = InvoiceState(
             task_id=task_id,
-            episode_id=episode_id,
+            episode_id=resolved_episode_id,
             current_step=0,
             max_steps=self.MAX_STEPS,
             done=False,
-            seed=seed,
+            seed=resolved_seed,
             ground_truth_fields=ground_truth,
             ground_truth_discrepancies=discrepancies,
             invoice_text=invoice_text,
@@ -70,20 +88,37 @@ class InvoiceEnvironment:
             consecutive_invalid=0,
         )
 
-        obs = self._make_observation("Environment reset. Begin processing the invoice.", "reset")
-        return obs, 0.0, False, {"episode_id": episode_id, "task_id": task_id}
+        # Store in global sessions for stateful HTTP step calls
+        _SESSIONS[resolved_episode_id] = self
 
-    def step(self, action: InvoiceAction) -> Tuple[InvoiceObservation, float, bool, Dict[str, Any]]:
-        """Execute one action and return observation, reward, done, info."""
+        obs = self._make_observation("Environment reset. Begin processing the invoice.", "reset")
+        obs.reward = 0.0
+        obs.done = False
+        obs.session_id = resolved_episode_id
+        return obs
+
+    def step(
+        self,
+        action: InvoiceAction,
+        timeout_s: Optional[float] = None,
+        **kwargs: Any,
+    ) -> InvoiceObservation:
+        """Execute one action and return observation."""
         if self._state is None:
-            raise RuntimeError("Environment not initialized. Call reset() first.")
+            # Auto-reset with defaults for stateless step calls
+            self.reset()
+
         if self._state.done:
-            raise RuntimeError("Episode is done. Call reset() to start a new episode.")
+            obs = self._make_observation("Episode is done. Call reset() to start new.", "noop")
+            obs.reward = 0.0
+            obs.done = True
+            obs.session_id = self._state.episode_id
+            return obs
 
         self._state.current_step += 1
         self._state.actions_taken.append(action.action_type)
         reward = 0.0
-        info: Dict[str, Any] = {}
+        grader_score = 0.0
         result_msg = ""
 
         try:
@@ -98,7 +133,7 @@ class InvoiceEnvironment:
             elif action.action_type == "validate":
                 reward, result_msg = self._handle_validate()
             elif action.action_type == "submit":
-                reward, result_msg, info = self._handle_submit()
+                reward, result_msg, grader_score = self._handle_submit()
             else:
                 reward = -0.05
                 result_msg = f"Unknown action type: {action.action_type}"
@@ -108,43 +143,40 @@ class InvoiceEnvironment:
             result_msg = f"Invalid action: {str(e)}"
             self._state.consecutive_invalid += 1
 
-        # Reset consecutive invalid counter on valid action
         if reward >= 0:
             self._state.consecutive_invalid = 0
 
-        # Check termination conditions
         if self._state.consecutive_invalid >= 3:
             self._state.done = True
             result_msg += " Episode ended: 3 consecutive invalid actions."
-            info["termination"] = "invalid_actions"
 
         if self._state.current_step >= self._state.max_steps and not self._state.done:
             self._state.done = True
-            reward -= 0.15  # Timeout penalty
+            reward -= 0.15
             result_msg += " Episode ended: max steps reached."
-            info["termination"] = "timeout"
-            # Auto-grade on timeout
             grader_score = self._run_grader()
-            info["grader_score"] = grader_score
 
         self._state.cumulative_reward += reward
         obs = self._make_observation(result_msg, action.action_type)
-        return obs, reward, self._state.done, info
+        obs.reward = reward
+        obs.done = self._state.done
+        obs.session_id = self._state.episode_id
+        obs.grader_score = grader_score
+        return obs
 
-    def state(self) -> Dict[str, Any]:
-        """Return the current environment state."""
+    @property
+    def state(self) -> State:
+        """Return current environment state."""
         if self._state is None:
-            return {"status": "not_initialized"}
-        return {
-            "task_id": self._state.task_id,
-            "episode_id": self._state.episode_id,
-            "current_step": self._state.current_step,
-            "max_steps": self._state.max_steps,
-            "done": self._state.done,
-            "cumulative_reward": self._state.cumulative_reward,
-            "fields_extracted": len(self._state.extracted_fields),
-            "discrepancies_flagged": len(self._state.flagged_discrepancies),
-        }
+            return State(episode_id=None, step_count=0)
+        return State(
+            episode_id=self._state.episode_id,
+            step_count=self._state.current_step,
+        )
+
+    def close(self) -> None:
+        """No-op: keep state alive for session-based step calls."""
+        pass
 
     # --- Action Handlers ---
 
@@ -155,25 +187,22 @@ class InvoiceEnvironment:
         fname = action.field_name.strip()
         fval = action.field_value.strip()
 
-        # Check for duplicate extraction
         if fname in self._state.extracted_fields:
             return -0.02, f"Field '{fname}' was already extracted. Use a different field."
 
         self._state.extracted_fields[fname] = fval
 
-        # Check accuracy against ground truth
         gt_val = self._state.ground_truth_fields.get(fname)
         if gt_val is None:
-            # Field not in ground truth — might be extra but not penalized heavily
             return 0.01, f"Field '{fname}' extracted (not a required field)."
 
         from invoice_agent.graders import _normalize
         if _normalize(fval) == _normalize(gt_val):
-            return 0.10, f"✓ Field '{fname}' extracted correctly."
+            return 0.10, f"Field '{fname}' extracted correctly."
         elif _normalize(gt_val) in _normalize(fval) or _normalize(fval) in _normalize(gt_val):
-            return 0.03, f"~ Field '{fname}' extracted with partial match."
+            return 0.03, f"Field '{fname}' extracted with partial match."
         else:
-            return -0.05, f"✗ Field '{fname}' extracted but value may be incorrect."
+            return -0.05, f"Field '{fname}' extracted but value may be incorrect."
 
     def _handle_lookup_vendor(self, action: InvoiceAction) -> Tuple[float, str]:
         if not action.vendor_query:
@@ -209,7 +238,6 @@ class InvoiceEnvironment:
         }
         self._state.flagged_discrepancies.append(flag_entry)
 
-        # Check if this matches a real discrepancy
         from invoice_agent.graders import _discrepancy_matches
         matched = any(
             _discrepancy_matches(flag_entry, gt)
@@ -217,15 +245,14 @@ class InvoiceEnvironment:
         )
 
         if matched:
-            return 0.15, f"✓ Valid discrepancy flagged for '{action.flag_field}'."
+            return 0.15, f"Valid discrepancy flagged for '{action.flag_field}'."
         else:
-            return -0.10, f"✗ No known discrepancy for '{action.flag_field}'."
+            return -0.10, f"No known discrepancy for '{action.flag_field}'."
 
     def _handle_validate(self) -> Tuple[float, str]:
         errors: List[str] = []
         warnings: List[str] = []
 
-        # Check if subtotal matches line items (basic math check)
         gt_subtotal = self._state.ground_truth_fields.get("subtotal", "")
         ext_subtotal = self._state.extracted_fields.get("subtotal", "")
 
@@ -236,7 +263,6 @@ class InvoiceEnvironment:
                     f"Subtotal value '{ext_subtotal}' may not match line item sum."
                 )
 
-        # Check required fields completeness
         required = get_required_fields(self._state.task_id)
         missing = [f for f in required if f not in self._state.extracted_fields]
         if missing:
@@ -252,26 +278,21 @@ class InvoiceEnvironment:
         else:
             return -0.01, "Validation passed with no issues."
 
-    def _handle_submit(self) -> Tuple[float, str, Dict[str, Any]]:
+    def _handle_submit(self) -> Tuple[float, str, float]:
         self._state.done = True
         grader_score = self._run_grader()
 
-        # Bonus/penalty based on accuracy
         if grader_score >= 0.8:
             reward = 0.20
-            msg = f"✓ Submission accepted. Grader score: {grader_score:.4f} (excellent)."
+            msg = f"Submission accepted. Grader score: {grader_score:.4f} (excellent)."
         elif grader_score >= 0.5:
             reward = 0.05
-            msg = f"✓ Submission accepted. Grader score: {grader_score:.4f} (good)."
+            msg = f"Submission accepted. Grader score: {grader_score:.4f} (good)."
         else:
             reward = -0.10
-            msg = f"✓ Submission accepted. Grader score: {grader_score:.4f} (needs improvement)."
+            msg = f"Submission accepted. Grader score: {grader_score:.4f} (needs improvement)."
 
-        info = {
-            "grader_score": grader_score,
-            "termination": "submitted",
-        }
-        return reward, msg, info
+        return reward, msg, grader_score
 
     def _run_grader(self) -> float:
         grader_fn = GRADERS.get(self._state.task_id, GRADERS["easy"])
@@ -281,8 +302,6 @@ class InvoiceEnvironment:
             self._state.ground_truth_fields,
             self._state.ground_truth_discrepancies,
         )
-
-    # --- Observation Builder ---
 
     def _make_observation(self, result_msg: str, action_type: str) -> InvoiceObservation:
         required = get_required_fields(self._state.task_id)
@@ -295,17 +314,15 @@ class InvoiceEnvironment:
             last_action_result=result_msg,
             last_action_type=action_type,
             vendor_lookup_result=(
-                {"matches": getattr(self, "_last_vendor_result", None)}
-                if hasattr(self, "_last_vendor_result") and self._last_vendor_result
+                {"matches": self._last_vendor_result}
+                if self._last_vendor_result
                 else None
             ),
             po_lookup_result=(
-                getattr(self, "_last_po_result", None)
-                if hasattr(self, "_last_po_result") and self._last_po_result
-                else None
+                self._last_po_result if self._last_po_result else None
             ),
-            validation_errors=getattr(self, "_last_validation_errors", None),
-            validation_warnings=getattr(self, "_last_validation_warnings", None),
+            validation_errors=self._last_validation_errors,
+            validation_warnings=self._last_validation_warnings,
             flagged_discrepancies=[dict(d) for d in self._state.flagged_discrepancies],
             fields_extracted=extracted_count,
             fields_remaining=len(required) - extracted_count,
@@ -313,7 +330,6 @@ class InvoiceEnvironment:
             max_steps=self._state.max_steps,
         )
 
-        # Clear transient results
         self._last_vendor_result = None
         self._last_po_result = None
         self._last_validation_errors = None
