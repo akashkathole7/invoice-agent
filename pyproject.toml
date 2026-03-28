@@ -12,6 +12,7 @@ license = {text = "MIT"}
 authors = [{name = "Akash Kathole", email = "akashkathole74@gmail.com"}]
 
 dependencies = [
+    "openenv-core>=0.2.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.0.0",
@@ -19,6 +20,9 @@ dependencies = [
     "requests>=2.31.0",
     "openai>=1.12.0",
 ]
+
+[project.scripts]
+server = "server.app:main"
 
 [project.optional-dependencies]
 dev = [
