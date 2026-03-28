@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from pydantic import BaseModel
+from fastapi import Request
+from starlette.routing import Route
 
 from openenv.core.env_server import create_app
 
@@ -13,48 +14,76 @@ from invoice_agent.server.invoice_environment import InvoiceEnvironment, _SESSIO
 from invoice_agent.graders import GRADERS
 from invoice_agent.data.invoice_templates import get_required_fields
 
-# Create the standard OpenEnv FastAPI app
+# Create the standard OpenEnv FastAPI app (provides /reset, /state, /health, /schema, /ws, /mcp)
 app = create_app(InvoiceEnvironment, InvoiceAction, InvoiceObservation)
 
+# Remove the standard /step route so we can replace it with one that tolerates empty body
+app.router.routes = [
+    r for r in app.router.routes
+    if not (isinstance(r, Route) and r.path == "/step")
+]
 
-# --- Custom session-based step (for stateful inference.py) ---
 
-class SessionStepRequest(BaseModel):
-    action: InvoiceAction
+# --- /step — tolerates empty body, handles both stateless and session-based calls ---
 
-
+@app.post("/step")
 @app.post("/step/{session_id}")
-async def session_step(session_id: str, req: SessionStepRequest) -> Dict[str, Any]:
-    """Stateful step using session ID returned by /reset."""
-    env = _SESSIONS.get(session_id)
-    if env is None:
-        return {"error": "Session not found. Call /reset first."}
+async def step(request: Request, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Execute an action. Accepts empty body (defaults to submit action)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
-    obs = env.step(req.action)
+    # Parse action from body
+    action_data = body.get("action", body) or {}
+    action_type = action_data.get("action_type", "submit")
+    try:
+        action = InvoiceAction(
+            action_type=action_type,
+            field_name=action_data.get("field_name"),
+            field_value=action_data.get("field_value"),
+            vendor_query=action_data.get("vendor_query"),
+            po_number=action_data.get("po_number"),
+            flag_field=action_data.get("flag_field"),
+            flag_reason=action_data.get("flag_reason"),
+        )
+    except Exception:
+        action = InvoiceAction(action_type="submit")
+
+    # Look up or create env for this session
+    env = _SESSIONS.get(session_id) if session_id else None
+    if env is None:
+        # Stateless: create fresh env (auto-resets on first step)
+        env = InvoiceEnvironment()
+        env.reset()
+
+    obs = env.step(action)
     info: Dict[str, Any] = {}
     if obs.done:
         info["grader_score"] = obs.grader_score
         info["termination"] = "submitted"
 
     return {
-        "observation": obs.model_dump(exclude={"reward", "done", "metadata", "grader_score", "session_id"}),
+        "observation": obs.model_dump(
+            exclude={"reward", "done", "metadata", "grader_score", "session_id"}
+        ),
         "reward": obs.reward,
         "done": obs.done,
         "info": info,
     }
 
 
-# --- Tasks endpoint ---
+# --- /tasks ---
 
 @app.get("/tasks")
 async def get_tasks() -> Dict[str, Any]:
-    """Return list of tasks and the action/observation schemas."""
     return {
         "tasks": [
             {
                 "task_id": "easy",
                 "name": "Clean Invoice Extraction",
-                "description": "Extract all fields from a simple, well-formatted invoice. No errors to detect.",
+                "description": "Extract all fields from a simple, well-formatted invoice.",
                 "difficulty": "easy",
                 "required_fields": get_required_fields("easy"),
                 "max_steps": 25,
@@ -62,7 +91,7 @@ async def get_tasks() -> Dict[str, Any]:
             {
                 "task_id": "medium",
                 "name": "Invoice with Validation Errors",
-                "description": "Extract fields AND detect 2-3 deliberate errors (math, tax, vendor mismatch).",
+                "description": "Extract fields AND detect 2-3 deliberate errors.",
                 "difficulty": "medium",
                 "required_fields": get_required_fields("medium"),
                 "max_steps": 25,
@@ -70,7 +99,7 @@ async def get_tasks() -> Dict[str, Any]:
             {
                 "task_id": "hard",
                 "name": "Multi-Document Reconciliation",
-                "description": "Extract, cross-reference with PO, reconcile line items, detect unauthorized charges and duplicates.",
+                "description": "Extract, cross-reference with PO, reconcile line items.",
                 "difficulty": "hard",
                 "required_fields": get_required_fields("hard"),
                 "max_steps": 25,
@@ -81,11 +110,10 @@ async def get_tasks() -> Dict[str, Any]:
     }
 
 
-# --- Baseline endpoint ---
+# --- /baseline — no body required ---
 
 @app.post("/baseline")
-async def run_baseline() -> Dict[str, Any]:
-    """Run heuristic baseline on all 3 tasks and return scores."""
+async def run_baseline(request: Request) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     for task_id in ["easy", "medium", "hard"]:
         env = InvoiceEnvironment()
@@ -95,26 +123,27 @@ async def run_baseline() -> Dict[str, Any]:
     return {"baseline_scores": results}
 
 
-# --- Grader endpoint ---
-
-class GraderRequest(BaseModel):
-    task_id: str = "easy"
-    seed: int = 42
-
+# --- /grader — tolerates empty body ---
 
 @app.post("/grader")
-async def run_grader(req: GraderRequest) -> Dict[str, Any]:
-    """Run grader on a fresh episode (default seed for reproducibility)."""
+async def run_grader(request: Request) -> Dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    task_id = body.get("task_id", "easy") if body else "easy"
+    seed = body.get("seed", 42) if body else 42
+
     env = InvoiceEnvironment()
-    env.reset(task_id=req.task_id, seed=req.seed)
-    grader_fn = GRADERS.get(req.task_id, GRADERS["easy"])
+    env.reset(task_id=task_id, seed=seed)
+    grader_fn = GRADERS.get(task_id, GRADERS["easy"])
     score = grader_fn(
         env._state.extracted_fields,
         env._state.flagged_discrepancies,
         env._state.ground_truth_fields,
         env._state.ground_truth_discrepancies,
     )
-    return {"task_id": req.task_id, "seed": req.seed, "grader_score": score}
+    return {"task_id": task_id, "seed": seed, "grader_score": score}
 
 
 # --- Heuristic baseline helper ---
@@ -146,14 +175,25 @@ def _run_heuristic_baseline(
                 value = match.group(1).strip()
                 if field_name in ("subtotal", "tax_amount", "total_amount"):
                     value = f"${value}"
-                action = InvoiceAction(action_type="extract_field", field_name=field_name, field_value=value)
+                action = InvoiceAction(
+                    action_type="extract_field",
+                    field_name=field_name,
+                    field_value=value,
+                )
                 obs = env.step(action)
                 if obs.done:
                     return obs.grader_score
 
     if task_id == "hard" and "line_item_count" in obs.required_fields:
-        lines = [l for l in text.split("\n") if re.match(r"^\w.+\d+\s+\$", l.strip())]
-        action = InvoiceAction(action_type="extract_field", field_name="line_item_count", field_value=str(len(lines)))
+        lines = [
+            l for l in text.split("\n")
+            if re.match(r"^\w.+\d+\s+\$", l.strip())
+        ]
+        action = InvoiceAction(
+            action_type="extract_field",
+            field_name="line_item_count",
+            field_value=str(len(lines)),
+        )
         obs = env.step(action)
         if obs.done:
             return obs.grader_score
