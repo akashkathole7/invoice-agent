@@ -1,0 +1,36 @@
+name: invoice_agent
+description: >
+  An OpenEnv environment for automated invoice processing. The agent receives
+  raw invoice text and must extract structured fields, validate against business
+  rules, cross-reference with vendor databases and purchase orders, and flag
+  discrepancies — simulating the real-world work of accounts payable clerks.
+author: Akash Kathole
+version: "1.0.0"
+tags:
+  - openenv
+  - invoice
+  - data-extraction
+  - accounts-payable
+  - real-world
+
+action_model: invoice_agent.models.InvoiceAction
+observation_model: invoice_agent.models.InvoiceObservation
+state_model: invoice_agent.models.InvoiceState
+
+server:
+  app: invoice_agent.server.app:app
+  port: 8000
+
+tasks:
+  - id: easy
+    name: Clean Invoice Extraction
+    description: Extract all fields from a simple, well-formatted invoice.
+    difficulty: easy
+  - id: medium
+    name: Invoice with Validation Errors
+    description: Extract fields and detect 2-3 deliberate errors.
+    difficulty: medium
+  - id: hard
+    name: Multi-Document Reconciliation
+    description: Extract, cross-reference with PO, reconcile line items, detect unauthorized charges.
+    difficulty: hard
