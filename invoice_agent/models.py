@@ -22,6 +22,7 @@ class InvoiceAction(Action):
         "extract_field",
         "lookup_vendor",
         "lookup_purchase_order",
+        "lookup_goods_receipt",
         "flag_discrepancy",
         "validate",
         "submit",
@@ -34,6 +35,12 @@ class InvoiceAction(Action):
     field_value: Optional[str] = Field(
         None, description="The extracted value for the field."
     )
+    confidence: Optional[float] = Field(
+        None,
+        description="Confidence 0.0-1.0 for extract_field. High confidence + correct = big reward. High confidence + wrong = big penalty.",
+        ge=0.0,
+        le=1.0,
+    )
 
     # For lookup_vendor
     vendor_query: Optional[str] = Field(
@@ -43,6 +50,11 @@ class InvoiceAction(Action):
     # For lookup_purchase_order
     po_number: Optional[str] = Field(
         None, description="Purchase order number to look up."
+    )
+
+    # For lookup_goods_receipt
+    gr_po_number: Optional[str] = Field(
+        None, description="PO number to look up goods receipt records for."
     )
 
     # For flag_discrepancy
@@ -81,6 +93,9 @@ class InvoiceObservation(Observation):
     po_lookup_result: Optional[Dict[str, Any]] = Field(
         None, description="Result from the most recent PO lookup."
     )
+    gr_lookup_result: Optional[Dict[str, Any]] = Field(
+        None, description="Result from the most recent goods receipt lookup."
+    )
     validation_errors: Optional[List[str]] = Field(
         None, description="Errors found during validation."
     )
@@ -100,6 +115,7 @@ class InvoiceObservation(Observation):
             "extract_field",
             "lookup_vendor",
             "lookup_purchase_order",
+            "lookup_goods_receipt",
             "flag_discrepancy",
             "validate",
             "submit",
@@ -122,6 +138,7 @@ class InvoiceState(BaseModel):
     max_steps: int = Field(25)
     done: bool = Field(False)
     seed: int = Field(0, description="Random seed for reproducibility.")
+    template_type: str = Field("standard", description="Invoice template type.")
 
     # Ground truth (hidden from agent)
     ground_truth_fields: Dict[str, str] = Field(default_factory=dict)
@@ -131,6 +148,7 @@ class InvoiceState(BaseModel):
     invoice_text: str = Field("")
     vendor_database: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     purchase_orders: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    goods_receipts: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
     # Agent progress
     extracted_fields: Dict[str, str] = Field(default_factory=dict)
@@ -139,4 +157,5 @@ class InvoiceState(BaseModel):
     # Scoring
     cumulative_reward: float = Field(0.0)
     actions_taken: List[str] = Field(default_factory=list)
+    confidence_records: List[Dict[str, Any]] = Field(default_factory=list)
     consecutive_invalid: int = Field(0)

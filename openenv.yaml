@@ -32,5 +32,5 @@ tasks:
     difficulty: medium
   - id: hard
     name: Multi-Document Reconciliation
-    description: Extract, cross-reference with PO, reconcile line items, detect unauthorized charges.
+    description: Extract, cross-reference with PO and goods receipts (3-way match), reconcile line items, detect unauthorized charges and quantity discrepancies.
     difficulty: hard

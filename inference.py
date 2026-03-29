@@ -36,17 +36,21 @@ SYSTEM_PROMPT = """You are an expert accounts payable agent. You process invoice
 1. Reading the invoice text carefully
 2. Extracting required fields one at a time using extract_field actions
 3. Looking up vendors and purchase orders for cross-referencing
-4. Validating the extracted data
-5. Flagging any discrepancies found
-6. Submitting when complete
+4. For hard tasks: looking up goods receipts for 3-way matching (invoice vs PO vs GR)
+5. Validating the extracted data
+6. Flagging any discrepancies found (math errors, vendor mismatches, quantity shortfalls, damaged goods)
+7. Submitting when complete
 
 You respond with a single JSON action object. Valid action types:
-- {"action_type": "extract_field", "field_name": "<name>", "field_value": "<value>"}
+- {"action_type": "extract_field", "field_name": "<name>", "field_value": "<value>", "confidence": 0.9}
 - {"action_type": "lookup_vendor", "vendor_query": "<search string>"}
 - {"action_type": "lookup_purchase_order", "po_number": "<PO number>"}
+- {"action_type": "lookup_goods_receipt", "gr_po_number": "<PO number>"}
 - {"action_type": "flag_discrepancy", "flag_field": "<field>", "flag_reason": "<reason>"}
 - {"action_type": "validate"}
 - {"action_type": "submit"}
+
+The "confidence" field (0.0-1.0) is optional for extract_field. High confidence + correct = bigger reward. High confidence + wrong = bigger penalty. If unsure, omit it or use a low value.
 
 IMPORTANT: Respond ONLY with a single valid JSON action. No explanation text."""
 
@@ -66,6 +70,8 @@ def build_user_prompt(obs: Dict[str, Any]) -> str:
         parts.append(f"VENDOR LOOKUP: {json.dumps(obs['vendor_lookup_result'])}")
     if obs.get("po_lookup_result"):
         parts.append(f"PO LOOKUP: {json.dumps(obs['po_lookup_result'])}")
+    if obs.get("gr_lookup_result"):
+        parts.append(f"GOODS RECEIPT: {json.dumps(obs['gr_lookup_result'])}")
     if obs.get("validation_errors"):
         parts.append(f"VALIDATION ERRORS: {obs['validation_errors']}")
     if obs.get("validation_warnings"):
@@ -118,11 +124,12 @@ def run_episode(task_id: str, seed: int = 42) -> float:
     obs = data["observation"]
     session_id = obs.get("session_id") or data.get("info", {}).get("session_id", "")
     done = data["done"]
+    max_steps = 30 if task_id == "hard" else 25
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     step_count = 0
 
-    while not done and step_count < 25:
+    while not done and step_count < max_steps:
         user_prompt = build_user_prompt(obs)
         messages.append({"role": "user", "content": user_prompt})
 

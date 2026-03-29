@@ -38,13 +38,24 @@ async def step(request: Request, session_id: Optional[str] = None) -> Dict[str, 
     # Parse action from body
     action_data = body.get("action", body) or {}
     action_type = action_data.get("action_type", "submit")
+    # Parse optional confidence (float or None)
+    raw_conf = action_data.get("confidence")
+    conf_val = None
+    if raw_conf is not None:
+        try:
+            conf_val = float(raw_conf)
+        except (TypeError, ValueError):
+            conf_val = None
+
     try:
         action = InvoiceAction(
             action_type=action_type,
             field_name=action_data.get("field_name"),
             field_value=action_data.get("field_value"),
+            confidence=conf_val,
             vendor_query=action_data.get("vendor_query"),
             po_number=action_data.get("po_number"),
+            gr_po_number=action_data.get("gr_po_number"),
             flag_field=action_data.get("flag_field"),
             flag_reason=action_data.get("flag_reason"),
         )
@@ -99,10 +110,10 @@ async def get_tasks() -> Dict[str, Any]:
             {
                 "task_id": "hard",
                 "name": "Multi-Document Reconciliation",
-                "description": "Extract, cross-reference with PO, reconcile line items.",
+                "description": "Extract, cross-reference with PO and goods receipts (3-way match), reconcile line items.",
                 "difficulty": "hard",
                 "required_fields": get_required_fields("hard"),
-                "max_steps": 25,
+                "max_steps": 30,
             },
         ],
         "action_schema": InvoiceAction.model_json_schema(),
@@ -166,6 +177,9 @@ def _run_heuristic_baseline(
         "total_amount": r"TOTAL DUE:\s*\$?([\d,]+\.?\d*)",
         "payment_terms": r"Payment Terms:\s*(.+?)(?:\n|$)",
         "due_date": r"Due Date:\s*(.+?)(?:\n|$)",
+        "discount_total": r"Discount Total:\s*\$?([\d,]+\.?\d*)",
+        "shipping_cost": r"Shipping & Handling:\s*\$?([\d,]+\.?\d*)",
+        "net_amount": r"Net Amount:\s*\$?([\d,]+\.?\d*)",
     }
 
     for field_name, pattern in patterns.items():

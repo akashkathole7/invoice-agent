@@ -19,6 +19,10 @@ from invoice_agent.data.purchase_orders import (
     generate_purchase_order,
     lookup_po,
 )
+from invoice_agent.data.goods_receipts import (
+    generate_goods_receipts,
+    lookup_goods_receipt,
+)
 from invoice_agent.data.vendor_database import generate_vendor_db, search_vendors
 from invoice_agent.graders import GRADERS
 from invoice_agent.models import InvoiceAction, InvoiceObservation, InvoiceState
@@ -39,6 +43,7 @@ class InvoiceEnvironment(Environment):
         self._state: Optional[InvoiceState] = None
         self._last_vendor_result = None
         self._last_po_result = None
+        self._last_gr_result = None
         self._last_validation_errors = None
         self._last_validation_warnings = None
 
@@ -68,19 +73,30 @@ class InvoiceEnvironment(Environment):
 
         vendor_db = generate_vendor_db(resolved_seed, invoice_data.vendor_name, task_id)
         purchase_orders = generate_purchase_order(resolved_seed, invoice_data, task_id)
+        goods_receipts = generate_goods_receipts(resolved_seed, invoice_data, task_id)
+
+        # Add GR-based discrepancies for hard tasks
+        if task_id == "hard" and goods_receipts:
+            from invoice_agent.data.goods_receipts import get_gr_discrepancies
+            gr_discs = get_gr_discrepancies(goods_receipts, invoice_data.po_number)
+            discrepancies.extend(gr_discs)
+
+        max_steps = 30 if task_id == "hard" else self.MAX_STEPS
 
         self._state = InvoiceState(
             task_id=task_id,
             episode_id=resolved_episode_id,
             current_step=0,
-            max_steps=self.MAX_STEPS,
+            max_steps=max_steps,
             done=False,
             seed=resolved_seed,
+            template_type=invoice_data.template_type,
             ground_truth_fields=ground_truth,
             ground_truth_discrepancies=discrepancies,
             invoice_text=invoice_text,
             vendor_database=vendor_db,
             purchase_orders=purchase_orders,
+            goods_receipts=goods_receipts,
             extracted_fields={},
             flagged_discrepancies=[],
             cumulative_reward=0.0,
@@ -128,6 +144,8 @@ class InvoiceEnvironment(Environment):
                 reward, result_msg = self._handle_lookup_vendor(action)
             elif action.action_type == "lookup_purchase_order":
                 reward, result_msg = self._handle_lookup_po(action)
+            elif action.action_type == "lookup_goods_receipt":
+                reward, result_msg = self._handle_lookup_gr(action)
             elif action.action_type == "flag_discrepancy":
                 reward, result_msg = self._handle_flag(action)
             elif action.action_type == "validate":
@@ -186,6 +204,7 @@ class InvoiceEnvironment(Environment):
 
         fname = action.field_name.strip()
         fval = action.field_value.strip()
+        conf = action.confidence  # Optional[float], None if not provided
 
         if fname in self._state.extracted_fields:
             return -0.02, f"Field '{fname}' was already extracted. Use a different field."
@@ -197,12 +216,35 @@ class InvoiceEnvironment(Environment):
             return 0.01, f"Field '{fname}' extracted (not a required field)."
 
         from invoice_agent.graders import _normalize
-        if _normalize(fval) == _normalize(gt_val):
-            return 0.10, f"Field '{fname}' extracted correctly."
-        elif _normalize(gt_val) in _normalize(fval) or _normalize(fval) in _normalize(gt_val):
-            return 0.03, f"Field '{fname}' extracted with partial match."
+        exact = _normalize(fval) == _normalize(gt_val)
+        partial = (
+            _normalize(gt_val) in _normalize(fval)
+            or _normalize(fval) in _normalize(gt_val)
+        )
+
+        if conf is not None:
+            # Confidence-based reward shaping
+            correct = exact or partial
+            self._state.confidence_records.append(
+                {"confidence": conf, "correct": correct}
+            )
+            if exact:
+                reward = 0.05 + 0.15 * conf
+                return reward, f"Field '{fname}' extracted correctly (confidence={conf:.2f})."
+            elif partial:
+                reward = 0.02 + 0.06 * conf
+                return reward, f"Field '{fname}' extracted with partial match (confidence={conf:.2f})."
+            else:
+                reward = -0.03 - 0.12 * conf
+                return reward, f"Field '{fname}' extracted incorrectly (confidence={conf:.2f})."
         else:
-            return -0.05, f"Field '{fname}' extracted but value may be incorrect."
+            # Original reward logic (no confidence)
+            if exact:
+                return 0.10, f"Field '{fname}' extracted correctly."
+            elif partial:
+                return 0.03, f"Field '{fname}' extracted with partial match."
+            else:
+                return -0.05, f"Field '{fname}' extracted but value may be incorrect."
 
     def _handle_lookup_vendor(self, action: InvoiceAction) -> Tuple[float, str]:
         if not action.vendor_query:
@@ -227,6 +269,19 @@ class InvoiceEnvironment(Environment):
             return 0.05, f"Purchase order {action.po_number} found."
         else:
             return 0.01, f"Purchase order {action.po_number} not found."
+
+    def _handle_lookup_gr(self, action: InvoiceAction) -> Tuple[float, str]:
+        po_num = action.gr_po_number or action.po_number
+        if not po_num:
+            return -0.05, "lookup_goods_receipt requires 'gr_po_number' (or 'po_number')."
+
+        result = lookup_goods_receipt(self._state.goods_receipts, po_num)
+        self._last_gr_result = result
+
+        if result:
+            return 0.05, f"Goods receipt for {po_num} found. {result.get('total_received', 0)} items received."
+        else:
+            return 0.01, f"No goods receipt found for {po_num}."
 
     def _handle_flag(self, action: InvoiceAction) -> Tuple[float, str]:
         if not action.flag_field or not action.flag_reason:
@@ -263,7 +318,7 @@ class InvoiceEnvironment(Environment):
                     f"Subtotal value '{ext_subtotal}' may not match line item sum."
                 )
 
-        required = get_required_fields(self._state.task_id)
+        required = get_required_fields(self._state.task_id, self._state.template_type)
         missing = [f for f in required if f not in self._state.extracted_fields]
         if missing:
             warnings.append(f"Missing required fields: {', '.join(missing)}")
@@ -296,6 +351,15 @@ class InvoiceEnvironment(Environment):
 
     def _run_grader(self) -> float:
         grader_fn = GRADERS.get(self._state.task_id, GRADERS["easy"])
+        # Medium and hard graders accept optional confidence_records
+        if self._state.task_id in ("medium", "hard"):
+            return grader_fn(
+                self._state.extracted_fields,
+                self._state.flagged_discrepancies,
+                self._state.ground_truth_fields,
+                self._state.ground_truth_discrepancies,
+                confidence_records=self._state.confidence_records,
+            )
         return grader_fn(
             self._state.extracted_fields,
             self._state.flagged_discrepancies,
@@ -304,7 +368,7 @@ class InvoiceEnvironment(Environment):
         )
 
     def _make_observation(self, result_msg: str, action_type: str) -> InvoiceObservation:
-        required = get_required_fields(self._state.task_id)
+        required = get_required_fields(self._state.task_id, self._state.template_type)
         extracted_count = sum(1 for f in required if f in self._state.extracted_fields)
 
         obs = InvoiceObservation(
@@ -321,6 +385,9 @@ class InvoiceEnvironment(Environment):
             po_lookup_result=(
                 self._last_po_result if self._last_po_result else None
             ),
+            gr_lookup_result=(
+                self._last_gr_result if self._last_gr_result else None
+            ),
             validation_errors=self._last_validation_errors,
             validation_warnings=self._last_validation_warnings,
             flagged_discrepancies=[dict(d) for d in self._state.flagged_discrepancies],
@@ -332,6 +399,7 @@ class InvoiceEnvironment(Environment):
 
         self._last_vendor_result = None
         self._last_po_result = None
+        self._last_gr_result = None
         self._last_validation_errors = None
         self._last_validation_warnings = None
 
