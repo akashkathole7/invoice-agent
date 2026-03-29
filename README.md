@@ -205,9 +205,9 @@ All POST endpoints accept empty bodies and will not error.
 
 | Task | Heuristic Baseline | LLM Baseline (estimated) |
 |------|-------------------|-------------------------|
-| Easy | ~0.75 | ~0.85 |
-| Medium | ~0.30 | ~0.55 |
-| Hard | ~0.10 | ~0.30 |
+| Easy | 0.79 | ~0.85 |
+| Medium | 0.47 | ~0.55 |
+| Hard | 0.19 | ~0.30 |
 
 ## Architecture
 
