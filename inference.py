@@ -1,36 +1,113 @@
-"""Baseline inference script for InvoiceAgent OpenEnv environment.
-
-Uses OpenAI Client with environment variables:
-  - API_BASE_URL: The API endpoint for the LLM
-  - MODEL_NAME: The model identifier to use for inference
-  - HF_TOKEN: Your Hugging Face / API key
-
-This script runs the LLM agent on all 3 tasks and reports scores.
-Must complete in under 20 minutes on vcpu=2, memory=8gb.
-"""
+"""InvoiceAgent inference script — matches official OpenEnv format."""
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import json
 import os
-import sys
+import re
+import subprocess
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from openai import OpenAI
 
-# --- Configuration from environment variables ---
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-inference.huggingface.co/v1")
-MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+# --- Environment variables ---
+IMAGE_NAME = os.getenv("IMAGE_NAME") or os.getenv("LOCAL_IMAGE_NAME")
+ENV_URL = os.getenv("ENV_URL")
+SPACE_URL = os.getenv("SPACE_URL")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 
-ENV_URL = os.environ.get("ENV_URL", "http://localhost:8000")
+BENCHMARK = "invoice_agent"
+MAX_STEPS = {"easy": 25, "medium": 25, "hard": 30}
+SUCCESS_THRESHOLD = 0.1
+_container_id = None
 
-client = OpenAI(
-    base_url=API_BASE_URL,
-    api_key=HF_TOKEN,
-)
+client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+# --- Structured logging (exact match to official sample) ---
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+
+# --- Environment setup (handles Docker, URL, or Space) ---
+
+def setup_environment():
+    """Determine how to connect to the environment. Priority:
+    1. ENV_URL already set (evaluator started the container)
+    2. IMAGE_NAME set (we start the container ourselves)
+    3. SPACE_URL set (connect to live HF Space)
+    4. Default to localhost:8000
+    """
+    global ENV_URL, _container_id
+
+    if ENV_URL:
+        print(f"[DEBUG] Using existing server at {ENV_URL}", flush=True)
+        return
+
+    if IMAGE_NAME:
+        print(f"[DEBUG] Starting container from image: {IMAGE_NAME}", flush=True)
+        try:
+            _container_id = subprocess.check_output([
+                "docker", "run", "-d", "--rm",
+                "-p", "8000:8000",
+                IMAGE_NAME
+            ]).decode().strip()
+            ENV_URL = "http://localhost:8000"
+
+            # Wait for container to be ready (max 30 seconds)
+            for i in range(30):
+                try:
+                    r = requests.get(f"{ENV_URL}/health", timeout=2)
+                    if r.status_code == 200:
+                        print(f"[DEBUG] Container ready after {i+1}s", flush=True)
+                        return
+                except Exception:
+                    pass
+                time.sleep(1)
+            print(f"[DEBUG] Container started but health check timed out", flush=True)
+            return
+        except Exception as e:
+            print(f"[DEBUG] Docker start failed: {e}, falling back", flush=True)
+
+    if SPACE_URL:
+        ENV_URL = SPACE_URL.rstrip("/")
+        print(f"[DEBUG] Using HF Space at {ENV_URL}", flush=True)
+        return
+
+    ENV_URL = "http://localhost:8000"
+    print(f"[DEBUG] Defaulting to {ENV_URL}", flush=True)
+
+def cleanup_container():
+    """Stop the container if we started one."""
+    global _container_id
+    if _container_id:
+        try:
+            subprocess.run(["docker", "stop", _container_id],
+                           capture_output=True, timeout=10)
+            print(f"[DEBUG] Container stopped", flush=True)
+        except Exception:
+            pass
+
+atexit.register(cleanup_container)
+
+# --- LLM interaction ---
 
 SYSTEM_PROMPT = """You are an expert accounts payable agent. You process invoices by:
 1. Reading the invoice text carefully
@@ -101,119 +178,116 @@ def parse_action(response_text: str) -> Dict[str, Any]:
         action = json.loads(text)
         return action
     except json.JSONDecodeError:
-        # Try to find JSON in the response
-        import re
         match = re.search(r"\{[^{}]+\}", text)
         if match:
             try:
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
-    # Fallback: submit
     return {"action_type": "submit"}
 
+# --- Episode runner ---
 
 def run_episode(task_id: str, seed: int = 42) -> float:
-    """Run a single episode using the LLM agent. Returns grader score."""
-    # Reset environment via HTTP
-    resp = requests.post(
-        f"{ENV_URL}/reset",
-        json={"task_id": task_id, "seed": seed},
-    )
-    data = resp.json()
-    obs = data["observation"]
-    session_id = obs.get("session_id") or data.get("info", {}).get("session_id", "")
-    done = data["done"]
-    max_steps = 30 if task_id == "hard" else 25
+    rewards_list: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+    max_steps = MAX_STEPS.get(task_id, 25)
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    step_count = 0
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
-    while not done and step_count < max_steps:
-        user_prompt = build_user_prompt(obs)
-        messages.append({"role": "user", "content": user_prompt})
+    try:
+        # Reset
+        resp = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id, "seed": seed})
+        data = resp.json()
+        obs = data["observation"]
+        session_id = obs.get("session_id") or data.get("info", {}).get("session_id", "")
+        done = data["done"]
 
-        try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                max_tokens=300,
-                temperature=0.1,
-            )
-            assistant_msg = response.choices[0].message.content or '{"action_type": "submit"}'
-        except Exception as e:
-            print(f"  LLM call failed: {e}")
-            assistant_msg = '{"action_type": "submit"}'
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-        messages.append({"role": "assistant", "content": assistant_msg})
-        action = parse_action(assistant_msg)
+        for step in range(1, max_steps + 1):
+            if done:
+                break
 
-        # Step the environment
-        try:
-            step_resp = requests.post(
-                f"{ENV_URL}/step/{session_id}",
-                json={"action": action},
-            )
-            step_data = step_resp.json()
-        except Exception as e:
-            print(f"  Step failed: {e}")
-            break
+            # LLM generates action
+            user_prompt = build_user_prompt(obs)
+            messages.append({"role": "user", "content": user_prompt})
 
-        if "error" in step_data:
-            print(f"  Env error: {step_data['error']}")
-            break
+            try:
+                response = client.chat.completions.create(
+                    model=MODEL_NAME, messages=messages,
+                    max_tokens=300, temperature=0.1,
+                )
+                assistant_msg = response.choices[0].message.content or '{"action_type": "submit"}'
+            except Exception as e:
+                print(f"[DEBUG] LLM error: {e}", flush=True)
+                assistant_msg = '{"action_type": "submit"}'
 
-        obs = step_data["observation"]
-        reward = step_data["reward"]
-        done = step_data["done"]
-        info = step_data.get("info", {})
-        step_count += 1
+            messages.append({"role": "assistant", "content": assistant_msg})
+            action = parse_action(assistant_msg)
 
-        print(f"  Step {step_count}: {action.get('action_type', '?')} -> reward={reward:.3f}")
+            # Step environment
+            try:
+                step_resp = requests.post(
+                    f"{ENV_URL}/step/{session_id}", json={"action": action}
+                )
+                step_data = step_resp.json()
+            except Exception as e:
+                print(f"[DEBUG] Step error: {e}", flush=True)
+                break
 
-        if done:
-            score = info.get("grader_score", 0.0)
-            print(f"  Episode done. Grader score: {score:.4f}")
-            return score
+            obs = step_data.get("observation", {})
+            reward = step_data.get("reward", 0.0)
+            done = step_data.get("done", False)
+            info = step_data.get("info", {})
 
-        # Keep message history manageable
-        if len(messages) > 20:
-            messages = [messages[0]] + messages[-10:]
+            # Build action string for log
+            action_str = action.get("action_type", "unknown")
+            param = (action.get("field_name") or action.get("vendor_query")
+                     or action.get("po_number") or action.get("gr_po_number") or "")
+            if param:
+                action_str += f"({param})"
 
-    return 0.0
+            # Detect error from observation
+            last_result = obs.get("last_action_result", "")
+            error = last_result if isinstance(last_result, str) and last_result.startswith("✗") else None
 
+            rewards_list.append(reward)
+            steps_taken = step
 
-def main() -> None:
-    """Run baseline inference on all 3 tasks."""
-    print("=" * 60)
-    print("InvoiceAgent Baseline Inference")
-    print(f"API: {API_BASE_URL}")
-    print(f"Model: {MODEL_NAME}")
-    print(f"Environment: {ENV_URL}")
-    print("=" * 60)
+            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
 
-    start_time = time.time()
-    results: Dict[str, float] = {}
+            if done:
+                score = info.get("grader_score", 0.0)
+                success = score >= SUCCESS_THRESHOLD
+                break
 
+            # Keep history manageable
+            if len(messages) > 20:
+                messages = [messages[0]] + messages[-10:]
+
+    except Exception as e:
+        print(f"[DEBUG] Episode error: {e}", flush=True)
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards_list)
+
+    return score
+
+# --- Main ---
+
+def main():
+    setup_environment()
+
+    results = {}
     for task_id in ["easy", "medium", "hard"]:
-        print(f"\n--- Task: {task_id} (seed=42) ---")
         score = run_episode(task_id, seed=42)
         results[task_id] = score
-        print(f"  Final score: {score:.4f}")
 
-    elapsed = time.time() - start_time
-
-    print("\n" + "=" * 60)
-    print("BASELINE RESULTS")
-    print("=" * 60)
-    for task_id, score in results.items():
-        print(f"  {task_id:>8}: {score:.4f}")
-    print(f"\n  Total time: {elapsed:.1f}s")
-    print("=" * 60)
-
-    # Output as JSON for automated parsing
-    print(json.dumps({"baseline_scores": results, "elapsed_seconds": round(elapsed, 1)}))
-
+    print(f"[DEBUG] All scores: {results}", flush=True)
+    cleanup_container()
 
 if __name__ == "__main__":
     main()
