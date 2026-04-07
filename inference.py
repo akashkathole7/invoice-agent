@@ -18,16 +18,16 @@ from openai import OpenAI
 IMAGE_NAME = os.getenv("IMAGE_NAME") or os.getenv("LOCAL_IMAGE_NAME")
 ENV_URL = os.getenv("ENV_URL")
 SPACE_URL = os.getenv("SPACE_URL")
-# CRITICAL: Evaluator injects API_BASE_URL and API_KEY.
-# Read API_KEY first (evaluator's variable), fall back to HF_TOKEN only for local testing.
-# Use os.environ.get with None check — NOT the `or` operator (which treats "" as falsy).
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+# For the OpenAI client: use API_KEY if set (evaluator's proxy), else HF_TOKEN
+# Use None check — NOT the `or` operator (which treats "" as falsy).
 _api_key = os.environ.get("API_KEY")
 if _api_key is None:
-    _api_key = os.environ.get("HF_TOKEN", "")
+    _api_key = HF_TOKEN or ""
 API_KEY = _api_key
-
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
 BENCHMARK = "invoice_agent"
 MAX_STEPS = {"easy": 25, "medium": 25, "hard": 30}
