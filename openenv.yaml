@@ -19,7 +19,7 @@ state_model: invoice_agent.models.InvoiceState
 
 server:
   app: invoice_agent.server.app:app
-  port: 8000
+  port: 7860
 
 tasks:
   - id: easy
