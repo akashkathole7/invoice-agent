@@ -141,10 +141,10 @@ class TestGraderPerfectScore:
         assert score > 0.7, f"Perfect extraction should score > 0.7, got {score}"
 
     def test_easy_perfect_score_is_one(self):
-        """Extracting every field exactly should return 1.0."""
+        """Extracting every field exactly should return max clamped score (0.999)."""
         gt = _ground_truth(42, "easy")
         score = grade_easy(dict(gt), [], gt, [])
-        assert score == 1.0, f"Expected 1.0, got {score}"
+        assert score == 0.999, f"Expected 0.999 (clamped max), got {score}"
 
     def test_medium_perfect_fields_high_score(self):
         """Extracting all fields correctly and flagging all discrepancies → high score."""
