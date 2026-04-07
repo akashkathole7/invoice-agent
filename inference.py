@@ -18,16 +18,23 @@ from openai import OpenAI
 IMAGE_NAME = os.getenv("IMAGE_NAME") or os.getenv("LOCAL_IMAGE_NAME")
 ENV_URL = os.getenv("ENV_URL")
 SPACE_URL = os.getenv("SPACE_URL")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+# CRITICAL: Evaluator injects API_BASE_URL and API_KEY.
+# Read API_KEY first (evaluator's variable), fall back to HF_TOKEN only for local testing.
+# Use os.environ.get with None check — NOT the `or` operator (which treats "" as falsy).
+_api_key = os.environ.get("API_KEY")
+if _api_key is None:
+    _api_key = os.environ.get("HF_TOKEN", "")
+API_KEY = _api_key
+
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
 BENCHMARK = "invoice_agent"
 MAX_STEPS = {"easy": 25, "medium": 25, "hard": 30}
 SUCCESS_THRESHOLD = 0.1
 _container_id = None
 
-client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+client = None  # Created inside main() after env vars are confirmed
 
 # --- Structured logging (exact match to official sample) ---
 
@@ -189,6 +196,7 @@ def parse_action(response_text: str) -> Dict[str, Any]:
 # --- Episode runner ---
 
 def run_episode(task_id: str, seed: int = 42) -> float:
+    global client  # Use the client created in main()
     rewards_list: List[float] = []
     steps_taken = 0
     score = 0.0
@@ -222,7 +230,7 @@ def run_episode(task_id: str, seed: int = 42) -> float:
                 )
                 assistant_msg = response.choices[0].message.content or '{"action_type": "submit"}'
             except Exception as e:
-                print(f"[DEBUG] LLM error: {e}", flush=True)
+                print(f"[DEBUG] LLM CALL FAILED: {type(e).__name__}: {e}", flush=True)
                 assistant_msg = '{"action_type": "submit"}'
 
             messages.append({"role": "assistant", "content": assistant_msg})
@@ -279,6 +287,14 @@ def run_episode(task_id: str, seed: int = 42) -> float:
 # --- Main ---
 
 def main():
+    global client
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+    # Debug: confirm which credentials are being used
+    print(f"[DEBUG] API_BASE_URL={API_BASE_URL}", flush=True)
+    print(f"[DEBUG] API_KEY={'set (' + API_KEY[:8] + '...)' if API_KEY else 'MISSING'}", flush=True)
+    print(f"[DEBUG] MODEL_NAME={MODEL_NAME}", flush=True)
+
     setup_environment()
 
     results = {}
