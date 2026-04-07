@@ -1,40 +1,56 @@
 """InvoiceAgent inference script — matches official OpenEnv format."""
 
-from __future__ import annotations
-
-import asyncio
-import atexit
 import json
 import os
 import re
-import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
 import requests
 from openai import OpenAI
 
-# --- Environment variables ---
-IMAGE_NAME = os.getenv("IMAGE_NAME") or os.getenv("LOCAL_IMAGE_NAME")
-ENV_URL = os.getenv("ENV_URL")
-SPACE_URL = os.getenv("SPACE_URL")
+# ============================================================
+# CREDENTIALS: Exactly as the evaluator email specifies
+# "Initialize your OpenAI client with
+#  base_url=os.environ["API_BASE_URL"] and
+#  api_key=os.environ["API_KEY"]"
+# ============================================================
+
+# Read with defaults for local testing, but evaluator WILL override these
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
 
-# For the OpenAI client: use API_KEY if set (evaluator's proxy), else HF_TOKEN
-# Use None check — NOT the `or` operator (which treats "" as falsy).
-_api_key = os.environ.get("API_KEY")
-if _api_key is None:
-    _api_key = HF_TOKEN or ""
-API_KEY = _api_key
+# API_KEY: evaluator injects this. Fall back to HF_TOKEN ONLY for local testing.
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN") or ""
 
+# Environment URL: where the InvoiceAgent server is running
+ENV_URL = os.getenv("ENV_URL") or os.getenv("SPACE_URL") or "http://localhost:8000"
+
+# ============================================================
+# DEBUG: Print EVERYTHING so we can see what the evaluator provides
+# ============================================================
+print(f"[DEBUG] ====== CREDENTIAL CHECK ======", flush=True)
+print(f"[DEBUG] API_BASE_URL = {API_BASE_URL}", flush=True)
+print(f"[DEBUG] API_KEY = {'SET (' + API_KEY[:12] + '...)' if API_KEY else 'EMPTY/MISSING'}", flush=True)
+print(f"[DEBUG] MODEL_NAME = {MODEL_NAME}", flush=True)
+print(f"[DEBUG] ENV_URL = {ENV_URL}", flush=True)
+print(f"[DEBUG] All env vars with API/KEY/URL/TOKEN:", flush=True)
+for key, val in sorted(os.environ.items()):
+    if any(x in key.upper() for x in ["API", "KEY", "URL", "TOKEN", "MODEL", "IMAGE", "SPACE", "HF", "ENV"]):
+        display_val = val[:20] + "..." if len(val) > 20 else val
+        print(f"[DEBUG]   {key} = {display_val}", flush=True)
+print(f"[DEBUG] ================================", flush=True)
+
+# Create client ONCE at module level
+client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+print(f"[DEBUG] OpenAI client created: base_url={client.base_url}", flush=True)
+
+# ============================================================
+# CONSTANTS
+# ============================================================
 BENCHMARK = "invoice_agent"
 MAX_STEPS = {"easy": 25, "medium": 25, "hard": 30}
 SUCCESS_THRESHOLD = 0.1
-_container_id = None
-
-client = None  # Created inside main() after env vars are confirmed
 
 # --- Structured logging (exact match to official sample) ---
 
@@ -53,66 +69,12 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
-# --- Environment setup (handles Docker, URL, or Space) ---
+# --- Environment setup ---
 
 def setup_environment():
-    """Determine how to connect to the environment. Priority:
-    1. ENV_URL already set (evaluator started the container)
-    2. IMAGE_NAME set (we start the container ourselves)
-    3. SPACE_URL set (connect to live HF Space)
-    4. Default to localhost:8000
-    """
-    global ENV_URL, _container_id
-
-    if ENV_URL:
-        print(f"[DEBUG] Using existing server at {ENV_URL}", flush=True)
-        return
-
-    if IMAGE_NAME:
-        print(f"[DEBUG] Starting container from image: {IMAGE_NAME}", flush=True)
-        try:
-            _container_id = subprocess.check_output([
-                "docker", "run", "-d", "--rm",
-                "-p", "8000:8000",
-                IMAGE_NAME
-            ]).decode().strip()
-            ENV_URL = "http://localhost:8000"
-
-            # Wait for container to be ready (max 30 seconds)
-            for i in range(30):
-                try:
-                    r = requests.get(f"{ENV_URL}/health", timeout=2)
-                    if r.status_code == 200:
-                        print(f"[DEBUG] Container ready after {i+1}s", flush=True)
-                        return
-                except Exception:
-                    pass
-                time.sleep(1)
-            print(f"[DEBUG] Container started but health check timed out", flush=True)
-            return
-        except Exception as e:
-            print(f"[DEBUG] Docker start failed: {e}, falling back", flush=True)
-
-    if SPACE_URL:
-        ENV_URL = SPACE_URL.rstrip("/")
-        print(f"[DEBUG] Using HF Space at {ENV_URL}", flush=True)
-        return
-
-    ENV_URL = "http://localhost:8000"
-    print(f"[DEBUG] Defaulting to {ENV_URL}", flush=True)
-
-def cleanup_container():
-    """Stop the container if we started one."""
-    global _container_id
-    if _container_id:
-        try:
-            subprocess.run(["docker", "stop", _container_id],
-                           capture_output=True, timeout=10)
-            print(f"[DEBUG] Container stopped", flush=True)
-        except Exception:
-            pass
-
-atexit.register(cleanup_container)
+    global ENV_URL
+    ENV_URL = os.getenv("ENV_URL") or os.getenv("SPACE_URL") or "http://localhost:8000"
+    print(f"[DEBUG] Environment URL: {ENV_URL}", flush=True)
 
 # --- LLM interaction ---
 
@@ -140,7 +102,6 @@ IMPORTANT: Respond ONLY with a single valid JSON action. No explanation text."""
 
 
 def build_user_prompt(obs: Dict[str, Any]) -> str:
-    """Build the user prompt from the observation."""
     parts = [
         f"INVOICE TEXT:\n{obs['invoice_text']}\n",
         f"REQUIRED FIELDS: {', '.join(obs['required_fields'])}",
@@ -168,9 +129,7 @@ def build_user_prompt(obs: Dict[str, Any]) -> str:
 
 
 def parse_action(response_text: str) -> Dict[str, Any]:
-    """Parse the LLM response into an action dict."""
     text = response_text.strip()
-    # Strip markdown code fences if present
     if text.startswith("```"):
         text = text.split("\n", 1)[-1]
         if text.endswith("```"):
@@ -182,8 +141,7 @@ def parse_action(response_text: str) -> Dict[str, Any]:
         text = text[3:]
 
     try:
-        action = json.loads(text)
-        return action
+        return json.loads(text)
     except json.JSONDecodeError:
         match = re.search(r"\{[^{}]+\}", text)
         if match:
@@ -196,7 +154,6 @@ def parse_action(response_text: str) -> Dict[str, Any]:
 # --- Episode runner ---
 
 def run_episode(task_id: str, seed: int = 42) -> float:
-    global client  # Use the client created in main()
     rewards_list: List[float] = []
     steps_taken = 0
     score = 0.0
@@ -206,9 +163,18 @@ def run_episode(task_id: str, seed: int = 42) -> float:
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # Reset
-        resp = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id, "seed": seed})
-        data = resp.json()
+        # Reset environment
+        print(f"[DEBUG] Connecting to environment at {ENV_URL}/reset", flush=True)
+        try:
+            resp = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id, "seed": seed}, timeout=30)
+            print(f"[DEBUG] Environment reset: status={resp.status_code}", flush=True)
+            data = resp.json()
+        except Exception as e:
+            print(f"[DEBUG] ENVIRONMENT CONNECTION FAILED: {type(e).__name__}: {e}", flush=True)
+            print(f"[DEBUG] Cannot reach {ENV_URL} — is the server running?", flush=True)
+            log_end(success=False, steps=0, score=0.0, rewards=[])
+            return 0.0
+
         obs = data["observation"]
         session_id = obs.get("session_id") or data.get("info", {}).get("session_id", "")
         done = data["done"]
@@ -219,18 +185,22 @@ def run_episode(task_id: str, seed: int = 42) -> float:
             if done:
                 break
 
-            # LLM generates action
             user_prompt = build_user_prompt(obs)
             messages.append({"role": "user", "content": user_prompt})
 
             try:
+                print(f"[DEBUG] Making LLM call to {API_BASE_URL} with model {MODEL_NAME}", flush=True)
                 response = client.chat.completions.create(
-                    model=MODEL_NAME, messages=messages,
-                    max_tokens=300, temperature=0.1,
+                    model=MODEL_NAME,
+                    messages=messages,
+                    max_tokens=300,
+                    temperature=0.1,
                 )
                 assistant_msg = response.choices[0].message.content or '{"action_type": "submit"}'
+                print(f"[DEBUG] LLM call SUCCESS, response length={len(assistant_msg)}", flush=True)
             except Exception as e:
                 print(f"[DEBUG] LLM CALL FAILED: {type(e).__name__}: {e}", flush=True)
+                print(f"[DEBUG] This means the proxy at {API_BASE_URL} rejected us or is unreachable", flush=True)
                 assistant_msg = '{"action_type": "submit"}'
 
             messages.append({"role": "assistant", "content": assistant_msg})
@@ -251,14 +221,12 @@ def run_episode(task_id: str, seed: int = 42) -> float:
             done = step_data.get("done", False)
             info = step_data.get("info", {})
 
-            # Build action string for log
             action_str = action.get("action_type", "unknown")
             param = (action.get("field_name") or action.get("vendor_query")
                      or action.get("po_number") or action.get("gr_po_number") or "")
             if param:
                 action_str += f"({param})"
 
-            # Detect error from observation
             last_result = obs.get("last_action_result", "")
             error = last_result if isinstance(last_result, str) and last_result.startswith("✗") else None
 
@@ -272,7 +240,6 @@ def run_episode(task_id: str, seed: int = 42) -> float:
                 success = score >= SUCCESS_THRESHOLD
                 break
 
-            # Keep history manageable
             if len(messages) > 20:
                 messages = [messages[0]] + messages[-10:]
 
@@ -287,14 +254,6 @@ def run_episode(task_id: str, seed: int = 42) -> float:
 # --- Main ---
 
 def main():
-    global client
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-    # Debug: confirm which credentials are being used
-    print(f"[DEBUG] API_BASE_URL={API_BASE_URL}", flush=True)
-    print(f"[DEBUG] API_KEY={'set (' + API_KEY[:8] + '...)' if API_KEY else 'MISSING'}", flush=True)
-    print(f"[DEBUG] MODEL_NAME={MODEL_NAME}", flush=True)
-
     setup_environment()
 
     results = {}
@@ -303,7 +262,6 @@ def main():
         results[task_id] = score
 
     print(f"[DEBUG] All scores: {results}", flush=True)
-    cleanup_container()
 
 if __name__ == "__main__":
     main()
