@@ -15,17 +15,15 @@ tags:
 
 # InvoiceAgent — OpenEnv Environment for Automated Invoice Processing
 
-> **OpenEnv hackathon submission** · Phase 1 ✅ · Phase 2 ✅ · Submission #17
-
 ## Baseline Scores (seed=42)
 
-| Task | Difficulty | Steps | Heuristic Baseline | LLM Baseline |
-|------|-----------|-------|-------------------|--------------|
-| Easy | Clean extraction | 25 | 0.79 | **0.999** |
-| Medium | Validation errors | 25 | 0.47 | **0.758** |
-| Hard | 3-way matching | 30 | 0.19 | **0.226** |
+| Task | Difficulty | Steps | Heuristic Baseline | LLM Baseline (Qwen2.5-72B) |
+|------|-----------|-------|-------------------|---------------------------|
+| Easy | Clean extraction | 25 | 0.7857 | **0.999** |
+| Medium | Validation errors | 25 | 0.4727 | **0.758** |
+| Hard | 3-way matching | 30 | 0.1875 | **0.226** |
 
-The gap between heuristic and LLM on medium/hard confirms the environment rewards genuine reasoning, not pattern matching.
+The LLM outperforms heuristics on all tasks. The medium/hard gap confirms the environment rewards genuine multi-step reasoning, not regex pattern matching.
 
 ---
 
@@ -51,7 +49,7 @@ Invoice Text
 │  extract_field ──► +0.10 (exact)        │
 │  lookup_vendor ──► +0.05 (found)        │
 │  lookup_po     ──► +0.05 (found)        │
-│  lookup_gr     ──► +0.05 (found)        │ ◄── Hard only
+│  lookup_gr     ──► +0.05 (found)        │ ◄── meaningful in Hard
 │  flag_discrepancy ► +0.15 (correct)     │
 │                     -0.10 (false pos)   │
 │  validate      ──► +0.05 (found errors) │
@@ -71,7 +69,7 @@ Invoice Text
 | `extract_field` | `field_name`, `field_value` | +0.10 exact / +0.03 partial / -0.05 wrong | `confidence` optional (shapes reward) |
 | `lookup_vendor` | `vendor_query` | +0.05 found / +0.02 not found | Fuzzy search across vendor DB |
 | `lookup_purchase_order` | `po_number` | +0.05 found / +0.01 not found | Validates PO reference |
-| `lookup_goods_receipt` | `gr_po_number` | +0.05 found / +0.01 not found | Hard task only |
+| `lookup_goods_receipt` | `gr_po_number` | +0.05 found / +0.01 not found | Available all tasks; GR data present in hard only |
 | `flag_discrepancy` | `flag_field`, `flag_reason` | +0.15 correct / -0.10 false positive | High stakes — penalizes hallucination |
 | `validate` | — | +0.05 / +0.02 / -0.01 | Checks math and completeness |
 | `submit` | — | +0.20 / +0.05 / -0.10 | Ends episode, triggers grader |
@@ -125,9 +123,9 @@ class InvoiceAction(Action):
 
 **What makes it solvable:** No errors injected. One document. Fields follow clear patterns.
 
-| Heuristic | LLM |
-|-----------|-----|
-| 0.79 | 0.999 |
+| Heuristic | LLM (Qwen2.5-72B) |
+|-----------|------------------|
+| 0.7857 | 0.999 |
 
 ---
 
@@ -149,9 +147,9 @@ score = 0.50 × field_accuracy
 
 **What makes it hard:** Agent must look up the vendor database to confirm the vendor name, run `validate` to catch math errors, and flag exact discrepancies (false positives cost -0.10).
 
-| Heuristic | LLM |
-|-----------|-----|
-| 0.47 | 0.758 |
+| Heuristic | LLM (Qwen2.5-72B) |
+|-----------|------------------|
+| 0.4727 | 0.758 |
 
 ---
 
@@ -175,9 +173,9 @@ score = 0.25 × field_accuracy
 
 **Why it challenges frontier models:** Requires sequential lookups (vendor → PO → GR), reasoning across 3 documents simultaneously, and conservative flagging (every false positive is penalized).
 
-| Heuristic | LLM |
-|-----------|-----|
-| 0.19 | 0.226 |
+| Heuristic | LLM (Qwen2.5-72B) |
+|-----------|------------------|
+| 0.1875 | 0.226 |
 
 ---
 
