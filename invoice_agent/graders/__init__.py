@@ -26,6 +26,11 @@ def _field_match(extracted: str, truth: str) -> float:
     return 0.0
 
 
+def _clamp(score: float) -> float:
+    """Clamp score to strictly (0, 1) as required by the evaluator."""
+    return round(min(max(score, 0.001), 0.999), 4)
+
+
 def grade_easy(
     extracted_fields: Dict[str, str],
     flagged_discrepancies: List[Dict[str, str]],
@@ -33,11 +38,11 @@ def grade_easy(
     ground_truth_discrepancies: List[Dict[str, str]],
 ) -> float:
     """Grade Task 1 (Easy): Clean invoice extraction.
-    
+
     Score = average field accuracy across all required fields.
     """
     if not ground_truth_fields:
-        return 0.0
+        return _clamp(0.0)
 
     total = 0.0
     count = len(ground_truth_fields)
@@ -47,7 +52,7 @@ def grade_easy(
         total += _field_match(extracted_value, truth_value)
 
     score = total / count if count > 0 else 0.0
-    return round(min(max(score, 0.0), 1.0), 4)
+    return _clamp(score)
 
 
 def grade_medium(
@@ -63,7 +68,7 @@ def grade_medium(
            + calibration_bonus (up to 0.05)
     """
     if not ground_truth_fields:
-        return 0.0
+        return _clamp(0.0)
 
     # --- Field accuracy (50%) ---
     field_total = 0.0
@@ -87,7 +92,7 @@ def grade_medium(
         cal_bonus = 0.05 * cal_score
 
     score = 0.50 * field_accuracy + 0.40 * disc_f1 + 0.10 * efficiency + cal_bonus
-    return round(min(max(score, 0.0), 1.0), 4)
+    return _clamp(score)
 
 
 def grade_hard(
@@ -107,7 +112,7 @@ def grade_hard(
     (quantity shortfalls, damaged goods, unreceived items).
     """
     if not ground_truth_fields:
-        return 0.0
+        return _clamp(0.0)
 
     # --- Field accuracy (25%) ---
     field_total = 0.0
@@ -160,7 +165,7 @@ def grade_hard(
         - fp_penalty
         + cal_bonus
     )
-    return round(min(max(score, 0.0), 1.0), 4)
+    return _clamp(score)
 
 
 def compute_calibration(confidence_records: List[Dict]) -> float:
