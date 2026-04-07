@@ -20,8 +20,10 @@ from openai import OpenAI
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
-# API_KEY: evaluator injects this. Fall back to HF_TOKEN ONLY for local testing.
-API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN") or ""
+# API_KEY: evaluator ALWAYS injects this via their LiteLLM proxy.
+# DO NOT fall back to HF_TOKEN — that would route calls to router.huggingface.co
+# and bypass the evaluator's proxy entirely (causing "LiteLLM key never used" failure).
+API_KEY = os.environ.get("API_KEY", "")
 
 # Environment URL: where the InvoiceAgent server is running
 ENV_URL = os.getenv("ENV_URL") or os.getenv("SPACE_URL") or "http://localhost:8000"
@@ -31,7 +33,10 @@ ENV_URL = os.getenv("ENV_URL") or os.getenv("SPACE_URL") or "http://localhost:80
 # ============================================================
 print(f"[DEBUG] ====== CREDENTIAL CHECK ======", flush=True)
 print(f"[DEBUG] API_BASE_URL = {API_BASE_URL}", flush=True)
-print(f"[DEBUG] API_KEY = {'SET (' + API_KEY[:12] + '...)' if API_KEY else 'EMPTY/MISSING'}", flush=True)
+if not API_KEY:
+    print(f"[DEBUG] WARNING: API_KEY is EMPTY — evaluator did not inject it!", flush=True)
+else:
+    print(f"[DEBUG] API_KEY = SET ({API_KEY[:12]}...)", flush=True)
 print(f"[DEBUG] MODEL_NAME = {MODEL_NAME}", flush=True)
 print(f"[DEBUG] ENV_URL = {ENV_URL}", flush=True)
 print(f"[DEBUG] All env vars with API/KEY/URL/TOKEN:", flush=True)
